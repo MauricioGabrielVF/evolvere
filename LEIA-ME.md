@@ -160,6 +160,139 @@ O Evolvere não se conecta direto no banco (isso exige autorização do Banco Ce
 
 ---
 
+## PARTE 11 — Subir esta versão (login + chat)
+
+Esta versão tem **2 arquivos novos** (`app.js` e `worker.js`) e **3 alterados** (`index.html`, `sw.js`, `LEIA-ME.md`).
+
+1. No GitHub, abra o repositório `evolvere` → **Add file** → **Upload files**.
+2. Arraste `index.html`, `app.js`, `sw.js` e `LEIA-ME.md`.
+   - **Não suba o `worker.js` no GitHub.** Ele vai para a Cloudflare (Parte 13).
+3. **Commit changes**. Espere 2 minutos.
+4. No celular, feche o app e abra de novo. Se ainda aparecer a versão antiga, feche e abra mais uma vez.
+
+---
+
+## PARTE 12 — Criar seu acesso (e-mail e senha)
+
+1. Ao abrir, aparece a tela **Crie seu acesso**.
+2. Digite seu e-mail e uma senha **forte**: 10 ou mais caracteres, com letra maiúscula, minúscula, número e símbolo.
+   - Use uma senha **diferente** da do seu Gmail.
+3. Repita a senha e toque em **Criar acesso**.
+4. Se você já tinha dados no app, eles são mantidos e passam a ficar trancados com essa senha.
+
+**Como a segurança funciona:**
+- Seus dados ficam **criptografados** no celular. Sem a senha, ninguém consegue ler, nem quem pegar o celular, nem quem abrir o código no GitHub.
+- A senha **não fica salva em lugar nenhum**, nem no código. Ela só serve para destrancar os dados.
+- Errou a senha 5 vezes? O app faz você esperar antes de tentar de novo.
+- O app **bloqueia sozinho** depois de 3 minutos fora dele.
+- O backup agora também sai **criptografado**: para restaurar, você precisa da senha que usava quando fez o backup.
+
+⚠️ **Não existe "recuperar senha".** Como só você tem a chave, se esquecer a senha os dados não abrem. Guarde a senha num lugar seguro e faça backup de vez em quando.
+
+Para trocar a senha: **Relatório → Segurança → Trocar senha**.
+
+---
+
+## PARTE 13 — Usar o chat
+
+1. Na tela inicial, toque em **Chat** (canto de cima).
+2. Escreva do jeito que você fala, sempre com o valor:
+   - `gastei 32,50 no ifood`
+   - `uber 18 ontem`
+   - `recebi 3500 de salário`
+   - `investi 500 no tesouro`
+   - `camiseta 120 imbecil` (já marca como gasto imbecil)
+   - `mercado 87 dia 5 às 19h`
+   - Várias de uma vez: `uber 18; almoço 25`
+3. Ele responde **Anotado ✓** mostrando como registrou. Se algo saiu errado, toque em **Desfazer**.
+4. Perguntas que ele responde: **saldo**, **gastos**, **imbecis**, **desfazer**.
+
+Isso funciona **sem internet e sem custo**: o próprio app entende a frase.
+
+### IA gratuita (opcional), para frases mais livres
+Sem a IA, o chat precisa de uma frase com valor. Com a IA, ele entende coisas como "paguei a conta de luz, deu cento e vinte".
+
+1. No computador, acesse **aistudio.google.com** e entre com sua conta Google.
+2. Clique em **Get API key** → **Create API key**. Copie a chave.
+3. **Proteja a chave:** clique na chave → restrinja para "Sites da Web" e coloque `https://SEU-USUARIO.github.io/*`. Assim ela só funciona no seu app.
+4. No app: **Relatório → Assistente e WhatsApp** → cole em **Chave da API Gemini** → **Salvar conexões**.
+5. Quando a IA entende algo, ela **pergunta antes de salvar** (botões Salvar / Descartar).
+
+**Sobre privacidade:** no plano gratuito, o Google pode usar o texto das mensagens que vão para a IA para melhorar os modelos dele. Só as frases que o chat não entendeu sozinho são enviadas, nunca o resto dos seus dados. Se não quiser isso, não coloque a chave: o chat continua funcionando.
+
+---
+
+## PARTE 14 — Registrar pelo WhatsApp (opcional, mais trabalhoso)
+
+Um site no GitHub não consegue receber mensagens do WhatsApp sozinho. Por isso existe a **ponte**: um pequeno programa grátis na Cloudflare que recebe suas mensagens e guarda até o app buscar.
+
+**Como fica no dia a dia:** você manda "gastei 20 no lanche" para o número do Evolvere no WhatsApp, ele responde "Anotado ✓", e quando você abre o app o gasto aparece.
+
+**Reserve uns 40 minutos.** Você vai precisar de: conta no Facebook/Meta, conta na Cloudflare (grátis) e o arquivo `worker.js`.
+
+### 14.1 — Criar o app do WhatsApp na Meta
+1. Acesse **developers.facebook.com** → entre com seu Facebook → **Meus apps** → **Criar app**.
+2. Escolha o caso de uso de **WhatsApp** (ou tipo **Empresa** e depois adicione o produto **WhatsApp**). Siga as telas até criar.
+3. No menu da esquerda: **WhatsApp → Configuração da API** (API Setup). Lá você vê:
+   - Um **número de teste** da Meta (é para esse número que você vai mandar as mensagens). Salve ele nos contatos do celular.
+   - O **ID do número de telefone** (Phone number ID). **Anote.**
+   - Em **Para** (To), adicione o **seu número** e confirme com o código que chega no WhatsApp.
+4. **Chave secreta do app:** menu **Configurações do app → Básico** → **Chave secreta do app** → Mostrar. **Anote.**
+5. **Token permanente** (o token que aparece na tela de API expira em 24 horas):
+   - Acesse **business.facebook.com** → **Configurações** → **Usuários do sistema** → **Adicionar** (função Administrador).
+   - Clique no usuário → **Atribuir ativos** → escolha seu app → controle total.
+   - **Gerar token** → escolha o app → marque `whatsapp_business_messaging` e `whatsapp_business_management` → validade **Nunca** → Gerar. **Anote** (só aparece uma vez).
+
+As telas da Meta mudam de vez em quando. Se algum nome estiver diferente, tire um print e me mande.
+
+### 14.2 — Criar a ponte na Cloudflare
+1. Acesse **dash.cloudflare.com** e crie uma conta grátis.
+2. Menu **Storage & Databases → KV** → **Create** → nome `evolvere-inbox` → Create.
+3. Menu **Workers & Pages → Create → Worker** → nome `evolvere-whatsapp` → **Deploy**.
+4. Clique em **Edit code**, apague tudo, cole o conteúdo do arquivo `worker.js` → **Deploy**.
+5. Volte ao worker → **Settings → Bindings → Add → KV namespace**: nome da variável `INBOX`, escolha `evolvere-inbox` → Save.
+6. **Settings → Variables and Secrets → Add**, escolha o tipo **Secret** para cada um:
+
+| Nome | O que colocar |
+|---|---|
+| `VERIFY_TOKEN` | Uma palavra-senha que você inventa (ex: `evolvere-verifica-8273`) |
+| `APP_SECRET` | A chave secreta do app (14.1, passo 4) |
+| `WA_TOKEN` | O token permanente (14.1, passo 5) |
+| `PHONE_NUMBER_ID` | O ID do número de telefone (14.1, passo 3) |
+| `ALLOWED_NUMBER` | Seu número só com dígitos, com e sem o 9: `5541999998888,554199998888` |
+| `PULL_TOKEN` | No app: **Relatório → Assistente → Gerar** (copia sozinho) e cole aqui |
+| `ALLOWED_ORIGIN` | `https://SEU-USUARIO.github.io` (sem barra no final) |
+
+7. Copie o endereço do worker, algo como `https://evolvere-whatsapp.SEU-NOME.workers.dev`.
+
+**Por que o número aparece duas vezes?** O WhatsApp às vezes manda números do Brasil sem o 9 da frente. Com os dois, funciona nos dois casos.
+
+### 14.3 — Ligar a Meta na ponte
+1. Na Meta: **WhatsApp → Configuração** (Configuration) → **Webhook → Editar**.
+2. **URL de retorno**: o endereço do worker + `/webhook` (ex: `https://evolvere-whatsapp.SEU-NOME.workers.dev/webhook`).
+3. **Token de verificação**: o mesmo `VERIFY_TOKEN` que você inventou.
+4. **Verificar e salvar**. Depois, em **Campos do webhook**, clique em **Assinar** no campo `messages`.
+
+### 14.4 — Ligar o app na ponte
+1. No app: **Relatório → Assistente e WhatsApp**.
+2. **Endereço da ponte**: o endereço do worker (sem `/webhook`).
+3. **Código secreto**: o mesmo `PULL_TOKEN` da Cloudflare.
+4. **Salvar conexões**.
+5. Mande `gastei 20 no lanche` para o número de teste no WhatsApp. Deve chegar "Anotado ✓".
+6. No app, toque em **Buscar mensagens do WhatsApp**. O gasto aparece no chat e no extrato.
+
+Depois disso, o app busca sozinho toda vez que você abre.
+
+**Segurança da ponte:**
+- Ela só aceita mensagens que vêm de verdade da Meta (confere uma assinatura digital).
+- Ela só aceita mensagens do **seu** número; mensagens de qualquer outro número são ignoradas.
+- Ela só entrega as mensagens para quem tem o código secreto.
+- As mensagens são apagadas da ponte assim que o app pega (ou depois de 30 dias).
+
+**Custos:** Cloudflare Workers e KV têm plano gratuito que sobra para uso pessoal. Na Meta, responder mensagens que você mandou (dentro de 24 horas) não é cobrado, e o número de teste é gratuito. Os planos e regras da Meta mudam, então confira no painel se aparecer qualquer aviso de cobrança.
+
+---
+
 ## Novidades desta versão
 
 - **Gráfico "Para onde seu dinheiro foi"** na tela inicial: mostra os destinos (Moradia, Mercado, Alimentação…) e quanto foi para investimentos. A visão antiga (ganhos x gastos x investimentos) continua no botão **Visão geral**.
@@ -181,4 +314,7 @@ O Evolvere não se conecta direto no banco (isso exige autorização do Banco Ce
 | Não aparece "Instalar app" | Use o Chrome, não outro navegador, e confirme que está em `https://` |
 | Não chegam notificações | Configurações do celular → Apps → Chrome → Notificações → ativar |
 | O extrato não abre / "Não achei transações" | Baixe de novo em OFX. Se só tiver PDF, o app não consegue ler: peça CSV ou OFX |
+| Esqueci a senha | Não tem como recuperar. Em "Esqueci a senha" você apaga tudo e restaura um backup (com a senha da época do backup) |
+| WhatsApp não responde "Anotado" | Confira o webhook (14.3), o `ALLOWED_NUMBER` com e sem o 9 e se o campo `messages` está assinado |
+| App diz "Não consegui falar com a ponte" | Confira o endereço (sem `/webhook`) e se o código secreto é igual nos dois lugares |
 | Perdi os dados | Só se não tiver backup. Por isso faça o backup periodicamente |

@@ -1,6 +1,6 @@
 // Evolvere — service worker: funciona offline + lembretes
-const CACHE = 'evolvere-v2';
-const SHELL = ['./', './index.html', './manifest.json', './icons/icon-192.png', './icons/icon-512.png', './icons/logo.png', './icons/apple-180.png'];
+const CACHE = 'evolvere-v3';
+const SHELL = ['./', './index.html', './app.js', './manifest.json', './icons/icon-192.png', './icons/icon-512.png', './icons/logo.png', './icons/apple-180.png'];
 const MSGS = [
   'Eae Maurício! Gaste menos e invista mais, comprou algo e esqueceu de registrar?',
   'Eae Maurício! Comprou alguma coisa e esqueceu de registrar? Gaste menos e invista mais.',
@@ -19,6 +19,8 @@ self.addEventListener('activate', e => {
 // rede primeiro (pega atualizações), cache se estiver offline
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
+  const u = new URL(e.request.url);
+  if (u.origin !== self.location.origin && !/fonts\.(googleapis|gstatic)\.com$/.test(u.hostname)) return;
   e.respondWith(
     fetch(e.request).then(res => {
       if (res && (res.ok || res.type === 'opaque')) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }
