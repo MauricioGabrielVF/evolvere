@@ -28,7 +28,7 @@ const HEX = {gasto:'#F2545B', ganho:'#4F9DFF', invest:'#3DCB8A'};
 const LABEL = {gasto:'Gasto', ganho:'Ganho', invest:'Investimento'};
 const CATS = {
   gasto:['Alimentação','Mercado','Transporte','Moradia','Contas','Saúde','Lazer','Compras','Educação','Assinaturas','Outros'],
-  ganho:['Salário','Freela','Renda extra','Presente','Reembolso','Outros'],
+  ganho:['Salário','Freela','Renda extra','Rendimentos','Presente','Reembolso','Outros'],
   invest:['Renda fixa','Ações','FIIs','Cripto','Tesouro','Reserva','Metas','Outros']
 };
 const ICON = {
@@ -39,30 +39,125 @@ const ICON = {
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove('show'),2200); }
 
 /* ═════════ armazenamento ═════════ */
-/* ═════════ cofre: dados criptografados com a sua senha ═════════ */
+/* ═════════ cofre: criptografia de ponta a ponta (celular ⇄ nuvem) ═════════
+   A senha gera duas chaves no próprio aparelho:
+   • CK: embaralha/desembaralha os dados (nunca sai do aparelho)
+   • AK: prova para o servidor que é você (o servidor guarda só um "hash" dela)
+   O servidor recebe apenas dados já embaralhados. */
 const KEY = 'evolvere.v1', VAULT = 'evolvere.vault', LOCK = 'evolvere.lock', ITER = 600000;
+const API = String(window.EVOLVERE_API || '').trim().replace(/\/+$/, '');
 function BLANK(){ return {tx:[], fixed:[], settings:{}, limits:[], goals:[], rules:{}, chat:[]}; }
 const normalizeDB = d => (d && Array.isArray(d.tx) && Array.isArray(d.fixed)) ? {...BLANK(), ...d} : BLANK();
-let DB = BLANK(), CK = null; // CK = chave derivada da senha, existe só na memória enquanto o app está aberto
+let DB = BLANK(), CK = null, AK = null, UH = null, REV = 0, EMAIL = '', CLOUD = false;
 const te = new TextEncoder(), td = new TextDecoder();
 function b64(buf){ const u = new Uint8Array(buf); let s = ''; for (let i=0; i<u.length; i+=0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i+0x8000)); return btoa(s); }
 const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-async function deriveKey(pass, salt, iter = ITER){
+async function sha256hex(s){ return [...new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(s)))].map(b => b.toString(16).padStart(2,'0')).join(''); }
+async function deriveKeys(email, pass){
+  const salt = new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode('evolvere-salt|' + email)));
+  const base = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveBits']);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2', salt, iterations:ITER, hash:'SHA-256'}, base, 512));
+  return { ck: await crypto.subtle.importKey('raw', bits.slice(0,32), {name:'AES-GCM'}, false, ['encrypt','decrypt']),
+           ak: b64(bits.slice(32)), uh: await sha256hex('evolvere-user|' + email) };
+}
+async function deriveKey(pass, salt, iter = ITER){ // formato antigo (versão 1), usado só para migrar
   const base = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:iter, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
 }
 async function seal(key, str){ const iv = crypto.getRandomValues(new Uint8Array(12)); return {iv:b64(iv), ct:b64(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, te.encode(str)))}; }
 async function unseal(key, box){ return JSON.parse(td.decode(await crypto.subtle.decrypt({name:'AES-GCM', iv:unb64(box.iv)}, key, unb64(box.ct)))); }
 const vault = () => { try { return JSON.parse(localStorage.getItem(VAULT)); } catch(e){ return null; } };
+function setKeys(k, email){ CK = k.ck; AK = k.ak; UH = k.uh; EMAIL = email; }
 let saving = Promise.resolve();
-function save(){
-  if (!CK) return;
-  const snap = JSON.stringify(DB), key = CK;
-  saving = saving.then(async () => {
-    const v = vault(); if (!v) return;
-    v.box = await seal(key, snap); localStorage.setItem(VAULT, JSON.stringify(v));
-  }).catch(() => toast('Não consegui salvar. Faça um backup.'));
+function writeLocal(){
+  if (!CK) return saving;
+  const snap = JSON.stringify(DB), key = CK, meta = {v:2, email:EMAIL, rev:REV, cloud:CLOUD};
+  saving = saving.then(async () => { localStorage.setItem(VAULT, JSON.stringify({...meta, box: await seal(key, snap)})); })
+    .catch(() => toast('Não consegui salvar. Faça um backup.'));
+  return saving;
 }
+function save(){ for (const t of DB.tx) if (t.c === undefined) t.c = Date.now(); writeLocal(); schedulePush(); }
+function fixOldData(){
+  let n = 0;
+  for (const t of DB.tx){
+    if (t.c === undefined) t.c = 0;
+    // versões antigas salvavam "Resgate" de investimento como GANHO: vira resgate (investimento voltando)
+    if (t.type === 'ganho' && /\bresgate\b/.test(plain(t.desc))){ t.type = 'invest'; t.resg = true; t.cat = CATS.invest.includes(guess(t.desc,'invest').cat) ? guess(t.desc,'invest').cat : 'Renda fixa'; t.cls = null; n++; }
+    if (t.importKey && /["“”]|\bCp\s*:/.test(t.desc)) t.desc = cleanDesc(t.desc);
+  }
+  if (n){ save(); setTimeout(() => toast(`${n} resgate(s) corrigido(s): não contam mais como ganho`), 1500); }
+}
+
+/* ═════════ sincronização ═════════ */
+const COLS = ['tx','fixed','limits','goals'];
+const idsOf = d => Object.fromEntries(COLS.map(c => [c, (d[c] || []).map(x => x.id)]));
+const syncOn = () => !!(API && AK && CLOUD);
+let pushTimer = null, pushing = false, dirty = false, syncState = '';
+async function api(path, body){
+  const ctrl = new AbortController(), t = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const r = await fetch(API + path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), cache:'no-store', signal:ctrl.signal});
+    let data = {}; try { data = await r.json(); } catch(e){}
+    return {status:r.status, data};
+  } finally { clearTimeout(t); }
+}
+function setSync(s){
+  syncState = s; const el = $('#s-sync'); if (!el) return;
+  el.textContent = {ok:'☁️ Sincronizado entre seus aparelhos', wait:'☁️ Sincronizando…', off:'☁️ Sem internet agora: está salvo no celular e envia quando a conexão voltar',
+    err:'☁️ Não consegui sincronizar. Se trocou a senha em outro aparelho, toque em Bloquear agora e entre com a senha nova.', local:'Os dados ficam só neste aparelho (sincronização desligada).'}[s] || '';
+}
+// junta o que mudou aqui com o que mudou em outro aparelho, sem perder nada e respeitando o que foi apagado
+function mergeDB(local, remote){
+  const known = local.syncIds || {}, out = {...remote, ...local};
+  for (const c of COLS){
+    const L = new Map((local[c] || []).map(x => [x.id, x])), Rm = new Map((remote[c] || []).map(x => [x.id, x])), K = new Set(known[c] || []);
+    const res = [];
+    for (const [id, x] of L){
+      if (!Rm.has(id) && K.has(id)) continue;               // apagado no outro aparelho
+      const r = Rm.get(id);
+      res.push(c === 'fixed' && r ? {...x, gen:[...new Set([...(x.gen || []), ...(r.gen || [])])]} : x);
+    }
+    for (const [id, x] of Rm) if (!L.has(id) && !K.has(id)) res.push(x); // novo do outro aparelho
+    out[c] = res;
+  }
+  out.rules = {...(remote.rules || {}), ...(local.rules || {})};
+  out.settings = {...(remote.settings || {}), ...(local.settings || {})};
+  return out;
+}
+function schedulePush(){ if (!syncOn()) return; dirty = true; clearTimeout(pushTimer); pushTimer = setTimeout(pushNow, 4000); }
+async function pushNow(){
+  if (!syncOn() || pushing || !dirty) return;
+  pushing = true; dirty = false; clearTimeout(pushTimer); setSync('wait');
+  let ok = false;
+  try {
+    for (let tries = 0; tries < 3 && !ok; tries++){
+      const snap = JSON.stringify(DB), ids = idsOf(DB);
+      const r = await api('/acct/save', {u:UH, a:AK, rev:REV, box: await seal(CK, snap)});
+      if (r.status === 200){ REV = r.data.rev; DB.syncIds = ids; ok = true; writeLocal(); setSync('ok'); }
+      else if (r.status === 409 && r.data.box){
+        const remote = normalizeDB(await unseal(CK, r.data.box));
+        DB = mergeDB(DB, remote); DB.syncIds = idsOf(remote); REV = r.data.rev; render();
+      } else throw Object.assign(new Error('sync'), {status:r.status});
+    }
+    if (!ok) dirty = true;
+  } catch(e){ dirty = true; setSync(e.status ? 'err' : 'off'); }
+  pushing = false;
+  if (ok && dirty) schedulePush();
+}
+async function pullNow(){
+  if (!syncOn() || pushing) return;
+  try {
+    const r = await api('/acct/login', {u:UH, a:AK});
+    if (r.status !== 200) return setSync(r.status === 401 ? 'err' : r.status === 429 ? 'err' : 'off');
+    if (r.data.rev !== REV){
+      const remote = normalizeDB(await unseal(CK, r.data.box)), before = JSON.stringify(COLS.map(c => remote[c]));
+      DB = mergeDB(DB, remote); DB.syncIds = idsOf(remote); REV = r.data.rev; writeLocal(); render();
+      if (JSON.stringify(COLS.map(c => DB[c])) !== before) dirty = true;
+    }
+    if (dirty) pushNow(); else setSync('ok');
+  } catch(e){ setSync('off'); }
+}
+window.addEventListener('online', () => { if (dirty) pushNow(); else pullNow(); });
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(()=>{});
 
 /* ═════════ fixos: geração automática ═════════ */
@@ -81,7 +176,7 @@ function generateFixed(){
       const day = Math.min(f.day, last);
       const date = `${key}-${pad(day)}`;
       if (!f.gen.includes(key) && date <= today()){
-        DB.tx.push({id:uid(), desc:f.name, value:f.value, type:f.type, cls:f.type==='gasto'?(f.cls||'nec'):null, cat:f.cat, date, fixedId:f.id});
+        DB.tx.push({id:`fx-${f.id}-${key}`, desc:f.name, value:f.value, type:f.type, cls:f.type==='gasto'?(f.cls||'nec'):null, cat:f.cat, date, fixedId:f.id});
         f.gen.push(key); changed = true;
       }
       m++; if (m>12){ m=1; y++; }
@@ -92,9 +187,17 @@ function generateFixed(){
 
 /* ═════════ consultas ═════════ */
 function inRange(from, to){ return DB.tx.filter(t => (!from || t.date >= from) && (!to || t.date <= to)); }
+// Regras dos totais:
+// • "Investido" = aplicações − resgates (o quanto saiu da conta para investir, de verdade)
+// • Resgate NÃO é ganho: é o seu próprio dinheiro voltando do investimento
+// • Lançamentos marcados "Não contar nos totais" (ex: Pix entre suas contas) ficam de fora
 function sum(list){
-  const s = {gasto:0, ganho:0, invest:0, imb:0, nec:0};
-  for (const t of list){ s[t.type] += t.value; if (t.type==='gasto') s[t.cls==='imb'?'imb':'nec'] += t.value; }
+  const s = {gasto:0, ganho:0, invest:0, imb:0, nec:0, aplic:0, resg:0};
+  for (const t of list){
+    if (t.skip) continue;
+    if (t.type==='invest'){ if (t.resg){ s.resg += t.value; s.invest -= t.value; } else { s.aplic += t.value; s.invest += t.value; } continue; }
+    s[t.type] += t.value; if (t.type==='gasto') s[t.cls==='imb'?'imb':'nec'] += t.value;
+  }
   for (const k in s) s[k] = Math.round(s[k]*100)/100;
   return s;
 }
@@ -122,22 +225,111 @@ function render(){
   else if (current==='fixed') renderPlan();
   else if (current==='report') renderReport();
   else if (current==='chat') renderChat();
+  else if (current==='settings') fillSettings();
 }
 
 /* ═════════ itens de lista ═════════ */
 function txItem(t){
-  const sign = t.type==='gasto' ? '−' : '+';
+  const sign = t.type==='gasto' || t.resg ? '−' : '+';
   const tags = [
     t.type==='gasto' ? `<span class="tag ${t.cls==='imb'?'imb':'nec'}">${t.cls==='imb'?'Imbecil':'Necessário'}</span>` : '',
     t.fixedId ? '<span class="tag rep">Fixo</span>' : '',
-    t.method ? `<span class="tag nec">${esc(t.method)}</span>` : ''
+    t.method ? `<span class="tag nec">${esc(t.method)}</span>` : '',
+    t.resg ? '<span class="tag rep">Resgate</span>' : '',
+    t.skip ? '<span class="tag imb">Fora dos totais</span>' : ''
   ].join('');
-  return `<button class="tx" data-edit="${t.id}">
+  return `<button class="tx" data-edit="${t.id}" style="${t.skip?'opacity:.55':''}">
     <span class="ic" style="background:${HEX[t.type]}22;color:${HEX[t.type]}">${ICON[t.type]}</span>
     <span class="mid"><span class="d">${esc(t.desc)}</span><span class="s">${esc(t.cat)}${t.time?' · '+t.time:''} ${tags}</span></span>
     <span class="amt" style="color:${COLORS[t.type]}">${sign} ${money(t.value)}</span></button>`;
 }
 document.addEventListener('click', e => { const b = e.target.closest('[data-edit]'); if (b) openTx(DB.tx.find(t => t.id === b.dataset.edit)); });
+
+/* ═════════ total investido (patrimônio) ═════════ */
+function patrimonio(){
+  const b = DB.settings.invBase; // {value, date, t}: valor real informado pelo usuário
+  let v = b ? b.value : 0;
+  for (const t of DB.tx){
+    if (t.type !== 'invest' || t.skip) continue;
+    if (b && (t.date < b.date || (t.date === b.date && (t.c || 0) <= b.t))) continue;
+    v += t.resg ? -t.value : t.value;
+  }
+  return Math.round(v * 100) / 100;
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('#h-patri')) return;
+  const cur = DB.settings.invBase ? patrimonio() : '';
+  const ans = prompt('Quanto você tem investido hoje, somando tudo? (veja no app do banco, em "Total investido")', cur ? String(cur.toFixed(2)).replace('.', ',') : '');
+  if (ans === null) return;
+  const v = parseAmount(ans);
+  if (!(v >= 0)) return toast('Valor inválido');
+  DB.settings.invBase = {value:v, date:today(), t:Date.now()}; save(); render(); toast('Total investido atualizado');
+});
+
+/* ═════════ boas-vindas ═════════ */
+const greet = () => { const h = new Date().getHours(); return h < 5 ? 'Boa noite' : h < 12 ? 'Bom dia' : h < 18 ? 'Boa tarde' : 'Boa noite'; };
+function renderWelcome(){
+  const nm = DB.settings.name;
+  if (!nm){
+    $('#h-welcome').innerHTML = `<div class="welcome"><h3>Bem-vindo(a) ao Evolvere! 👋</h3>
+      <p>Que bom ter você aqui. Para começar, como você quer ser chamado(a)?</p>
+      <div class="row"><input class="in" id="w-name" maxlength="30" placeholder="Seu nome" autocomplete="given-name" style="flex:1;min-width:0"><button class="pill" id="w-save">Salvar</button></div></div>`;
+    return;
+  }
+  const tips = !DB.settings.tipsOff ? `<ul><li>Toque no <b>+</b> para registrar um gasto, ganho ou investimento</li><li>No <b>Chat</b>, é só escrever: "gastei 25 no almoço"</li><li>No menu <b>☰</b> você importa o extrato do banco e planeja limites e metas</li></ul>
+      <div class="row"><button class="pill" id="w-ok">Entendi</button></div>` : '';
+  $('#h-welcome').innerHTML = `<div class="welcome"><h3>${greet()}, ${esc(nm)}! 👋</h3><p>Bem-vindo(a) ao Evolvere. Desenrolar, desdobrar, evoluir.</p>${tips}</div>`;
+}
+function setName(v){ v = String(v || '').trim().slice(0, 30); if (!v) return toast('Digite seu nome'); DB.settings.name = v; save(); shareName(); render(); toast(`Prazer, ${v}!`); }
+document.addEventListener('click', e => {
+  if (e.target.closest('#w-save')) setName($('#w-name').value);
+  if (e.target.closest('#w-ok')){ DB.settings.tipsOff = true; save(); renderWelcome(); }
+  if (e.target.closest('#s-name-save')) setName($('#s-name').value);
+});
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'w-name') setName(e.target.value); });
+
+/* ═════════ menu lateral ═════════ */
+function openDrawer(){
+  $('#dr-name').textContent = DB.settings.name ? `Olá, ${DB.settings.name}` : 'Evolvere';
+  $('#dr-email').textContent = EMAIL || '';
+  $$('#drawer [data-go]').forEach(b => b.classList.toggle('on', b.dataset.go === current));
+  $('#drawer').classList.add('open'); $('#dr-scrim').classList.add('open'); $('#menu-open').setAttribute('aria-expanded', 'true');
+  history.pushState({drawer:1}, '');
+}
+function closeDrawer(fromPop){
+  if (!$('#drawer').classList.contains('open')) return;
+  $('#drawer').classList.remove('open'); $('#dr-scrim').classList.remove('open'); $('#menu-open').setAttribute('aria-expanded', 'false');
+  if (fromPop !== true && history.state && history.state.drawer) history.back();
+}
+$('#menu-open').addEventListener('click', openDrawer);
+$('#dr-scrim').addEventListener('click', () => closeDrawer());
+$('#drawer').addEventListener('click', e => { if (e.target.closest('.dr-item')) closeDrawer(); });
+$('#dr-lock').addEventListener('click', () => $('#s-lock').click());
+
+const hardReload = () => setTimeout(() => location.reload(), 350);
+
+/* trocar de conta: sai só deste aparelho (os dados ficam na nuvem) */
+$('#dr-switch').addEventListener('click', async () => {
+  if (syncOn() && dirty) await pushNow();
+  const safe = syncOn() && !dirty;
+  if (!confirm(safe ? 'Trocar de conta?\n\nVocê sai desta conta neste aparelho. Seus dados continuam guardados na nuvem e voltam quando você entrar de novo.'
+                    : 'ATENÇÃO: esta conta NÃO está sincronizada com a nuvem.\n\nTrocar de conta apaga os dados dela deste aparelho. Faça um backup antes (Ajustes → Salvar backup).\n\nTrocar mesmo assim?')) return;
+  try { caches.delete('evolvere-meta'); } catch(e){}
+  localStorage.removeItem(VAULT); localStorage.removeItem(LOCK); hardReload();
+});
+
+/* reiniciar app: apaga todos os registros e volta a conta ao início (o login continua) */
+$('#dr-reset').addEventListener('click', async () => {
+  if (!confirm('Reiniciar o app?\n\nIsso APAGA todos os seus gastos, ganhos, investimentos, fixos, limites, metas, conversas do chat e o total investido' + (syncOn() ? ', também na nuvem e nos seus outros aparelhos' : '') + '.\n\nSeu login, seu nome e as conexões (IA e WhatsApp) continuam.')) return;
+  if (confirm('Quer salvar um backup antes? (recomendado)\n\nOK = salvar backup primeiro\nCancelar = seguir sem backup')){ $('#b-export').click(); await new Promise(r => setTimeout(r, 1500)); }
+  const typed = prompt('Para confirmar, digite APAGAR');
+  if (String(typed || '').trim().toUpperCase() !== 'APAGAR'){ toast('Cancelado. Nada foi apagado.'); return; }
+  const S = DB.settings, keep = {};
+  for (const k of ['name','gkey','gmodel','wurl','wtok','waSeen','notifAsked']) if (S[k] !== undefined) keep[k] = S[k];
+  DB = {...BLANK(), settings:keep, syncIds:DB.syncIds}; // syncIds avisa a nuvem que tudo foi apagado de propósito
+  save(); if (syncOn()){ dirty = true; await pushNow(); }
+  go('home'); toast('App reiniciado. Começando do zero!');
+});
 
 /* ═════════ INÍCIO ═════════ */
 function renderHome(){
@@ -153,7 +345,11 @@ function renderHome(){
   const pct = s.gasto ? Math.round(s.imb/s.gasto*100) : 0;
   $('#h-imbbar').style.width = pct+'%';
   $('#h-imbpct').innerHTML = s.gasto ? `<b style="color:var(--txt);font-size:18px">${pct}%</b><br>dos gastos` : 'Nada ainda';
-  drawDonut(s, list); renderHomeLimits(); renderBills();
+  renderWelcome(); drawDonut(s, list); renderHomeLimits(); renderBills();
+  $('#h-inv').title = `Aplicado ${money(s.aplic)} − resgatado ${money(s.resg)}`;
+  $('#h-patri').innerHTML = DB.settings.invBase
+    ? `<div class="row"><span class="muted">Total investido hoje</span><b style="color:var(--green)">${money(patrimonio())}</b></div><div class="row small muted"><span>No mês: aplicou ${money(s.aplic)} · resgatou ${money(s.resg)}</span><span style="color:var(--gold)">Atualizar</span></div>`
+    : `<div class="row"><span class="muted">Total investido hoje</span><b style="color:var(--gold)">Informar</b></div><div class="row small muted"><span>Toque e digite o total que aparece no seu banco</span></div>`;
   const recent = sortTx(list).slice(0,6);
   $('#h-list').innerHTML = recent.length ? recent.map(txItem).join('') :
     `<div class="empty"><b>Mês novo, página em branco</b>Toque no botão + para registrar o primeiro gasto, ganho ou investimento.</div>`;
@@ -168,11 +364,11 @@ function drawDonut(s, list){
     let arr = Object.entries(by).sort((a,b)=>b[1]-a[1]);
     if (arr.length > 6){ const rest = arr.slice(5).reduce((a,x)=>a+x[1],0); arr = arr.slice(0,5).concat([['Outros destinos', rest]]); }
     parts = arr.map(([c,v],i) => ({label:c, value:v, color:CAT_COLORS[i % CAT_COLORS.length]}));
-    if (s.invest) parts.push({label:'Investimentos', value:s.invest, color:HEX.invest});
-    total = s.gasto + s.invest; sub = 'saíram este mês';
+    if (s.invest > 0) parts.push({label:'Investimentos', value:s.invest, color:HEX.invest});
+    total = s.gasto + Math.max(0, s.invest); sub = 'saíram este mês';
   } else {
-    parts = [{label:'Ganhos',value:s.ganho,color:HEX.ganho},{label:'Gastos',value:s.gasto,color:HEX.gasto},{label:'Investimentos',value:s.invest,color:HEX.invest}];
-    total = s.ganho + s.gasto + s.invest; sub = 'movimentado';
+    parts = [{label:'Ganhos',value:s.ganho,color:HEX.ganho},{label:'Gastos',value:s.gasto,color:HEX.gasto},{label:'Investimentos',value:Math.max(0, s.invest),color:HEX.invest}];
+    total = s.ganho + s.gasto + Math.max(0, s.invest); sub = 'movimentado';
   }
   const C = 2*Math.PI*15.9155, n = parts.filter(p=>p.value>0).length, gap = n>1 ? 0.6 : 0;
   let off = 0, svg = `<circle cx="21" cy="21" r="15.9155" fill="none" stroke="#252836" stroke-width="5"/>`;
@@ -213,7 +409,8 @@ function buildSeries(){
 function renderCharts(){
   const data = buildSeries();
   const W=340, H=240, pl=44, pr=10, pt=14, pb=28, iw=W-pl-pr, ih=H-pt-pb;
-  const max = Math.max(10, ...data.map(d=>Math.max(d.gasto,d.ganho,d.invest))) * 1.15;
+  data.forEach(d => { d.investShow = Math.max(0, d.invest); });
+  const max = Math.max(10, ...data.map(d=>Math.max(d.gasto,d.ganho,d.investShow))) * 1.15;
   const x = i => pl + (data.length===1 ? iw/2 : i*iw/(data.length-1));
   const y = v => pt + ih - v/max*ih;
   let g = '';
@@ -224,8 +421,8 @@ function renderCharts(){
     if (!i) return `M${px},${py}`; const p=x(i-1), pv=y(data[i-1][k]), cx=(p+px)/2; return `C${cx},${pv} ${cx},${py} ${px},${py}`; }).join(' ');
   const area = k => `${path(k)} L${x(data.length-1)},${pt+ih} L${x(0)},${pt+ih} Z`;
   let lines = '';
-  for (const k of ['ganho','invest','gasto']){
-    lines += `<path d="${area(k)}" fill="url(#g-${k})"/><path d="${path(k)}" fill="none" stroke="${HEX[k]}" stroke-width="2.4" stroke-linecap="round"/>`;
+  for (const k of ['ganho','investShow','gasto']){
+    lines += `<path d="${area(k)}" fill="url(#g-${k==='investShow'?'invest':k})"/><path d="${path(k)}" fill="none" stroke="${HEX[k==='investShow'?'invest':k]}" stroke-width="2.4" stroke-linecap="round"/>`;
   }
   const defs = ['gasto','ganho','invest'].map(k=>`<linearGradient id="g-${k}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${HEX[k]}" stop-opacity=".18"/><stop offset="1" stop-color="${HEX[k]}" stop-opacity="0"/></linearGradient>`).join('');
   $('#chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" id="lc"><defs>${defs}</defs>${g}${lines}<line id="cur" y1="${pt}" y2="${pt+ih}" stroke="#F1E3A0" stroke-width="1" opacity="0"/><g id="dots"></g></svg><div class="tip hidden" id="tip"></div>`;
@@ -235,20 +432,21 @@ function renderCharts(){
     let i = data.length===1 ? 0 : Math.round((px-pl)/(iw/(data.length-1))); i = Math.max(0, Math.min(data.length-1, i));
     const d = data[i], cx = x(i);
     $('#cur').setAttribute('x1',cx); $('#cur').setAttribute('x2',cx); $('#cur').setAttribute('opacity','.5');
-    $('#dots').innerHTML = ['gasto','ganho','invest'].map(k=>`<circle cx="${cx}" cy="${y(d[k])}" r="3.6" fill="${HEX[k]}" stroke="#1D1F2B" stroke-width="1.5"/>`).join('');
+    $('#dots').innerHTML = ['gasto','ganho','invest'].map(k=>`<circle cx="${cx}" cy="${y(k==='invest'?d.investShow:d[k])}" r="3.6" fill="${HEX[k]}" stroke="#1D1F2B" stroke-width="1.5"/>`).join('');
     const label = period==='3' ? `Semana de ${d.label}` : d.label;
-    tip.innerHTML = `<b style="display:block;margin-bottom:4px">${label}</b><div><span style="color:var(--blue)">Ganhos</span>${money(d.ganho)}</div><div><span style="color:var(--red)">Gastos</span>${money(d.gasto)}</div><div><span style="color:var(--green)">Investido</span>${money(d.invest)}</div>`;
+    tip.innerHTML = `<b style="display:block;margin-bottom:4px">${label}</b><div><span style="color:var(--blue)">Ganhos</span>${money(d.ganho)}</div><div><span style="color:var(--red)">Gastos</span>${money(d.gasto)}</div><div><span style="color:var(--green)">Investido</span>${money(d.invest)}</div><div><span class="muted">Resgatado</span>${money(d.resg)}</div>`;
     tip.classList.remove('hidden');
     const leftPx = cx/W*r.width; tip.style.left = Math.max(75, Math.min(r.width-75, leftPx))+'px';
   };
   svg.addEventListener('pointerdown', pick); svg.addEventListener('pointermove', e => { if (e.buttons || e.pointerType!=='mouse') pick(e); });
   // resumo
-  const s = data.reduce((a,d)=>({gasto:a.gasto+d.gasto, ganho:a.ganho+d.ganho, invest:a.invest+d.invest, imb:a.imb+d.imb}), {gasto:0,ganho:0,invest:0,imb:0});
+  const s = data.reduce((a,d)=>({gasto:a.gasto+d.gasto, ganho:a.ganho+d.ganho, invest:a.invest+d.invest, imb:a.imb+d.imb, aplic:a.aplic+d.aplic, resg:a.resg+d.resg}), {gasto:0,ganho:0,invest:0,imb:0,aplic:0,resg:0});
   const saldo = s.ganho - s.gasto - s.invest;
   $('#c-sum').innerHTML = `<div><span class="muted">Ganhos</span><b style="color:var(--blue)">${money(s.ganho)}</b></div>
     <div><span class="muted">Gastos</span><b style="color:var(--red)">${money(s.gasto)}</b></div>
     <div><span class="muted">Gastos imbecis</span><b style="color:#FF8A8F">${money(s.imb)}</b></div>
-    <div><span class="muted">Investimentos</span><b style="color:var(--green)">${money(s.invest)}</b></div>
+    <div><span class="muted">Investido (aplicado − resgatado)</span><b style="color:var(--green)">${money(s.invest)}</b></div>
+    <div><span class="muted">· aplicado / resgatado</span><b class="muted">${money(s.aplic)} / ${money(s.resg)}</b></div>
     <div><span class="muted">Saldo</span><b class="${saldo<0?'neg':'pos'}">${money(saldo)}</b></div>`;
 }
 
@@ -256,17 +454,38 @@ function renderCharts(){
 let xf = 'all';
 $('#x-filter').addEventListener('click', e => { const b=e.target.closest('.chip'); if(!b) return; xf=b.dataset.f; $$('#x-filter .chip').forEach(c=>c.classList.toggle('on',c===b)); renderHistory(); });
 $('#x-search').addEventListener('input', () => renderHistory());
+// lançamentos com mesmo tipo e valor em datas próximas: podem ser o mesmo registrado 2 vezes
+function findDups(){
+  const by = {}, out = new Set();
+  for (const t of DB.tx){ if (t.skip) continue; (by[t.type+'|'+(t.resg?1:0)+'|'+t.value.toFixed(2)] ||= []).push(t); }
+  for (const g of Object.values(by)){
+    if (g.length < 2) continue;
+    g.sort((a,b) => a.date.localeCompare(b.date));
+    for (let i=0; i<g.length; i++) for (let j=i+1; j<g.length; j++){
+      const a = g[i], b = g[j], dd = Math.round((parseYmd(b.date) - parseYmd(a.date)) / 864e5);
+      if (dd > ((a.fixedId || b.fixedId) ? 6 : 2)) break;
+      out.add(a.id); out.add(b.id);
+    }
+  }
+  return out;
+}
+let dupSet = new Set();
 function renderHistory(){
+  dupSet = findDups();
   const q = $('#x-search').value.trim().toLowerCase();
   let list = sortTx(DB.tx).filter(t => {
     if (xf==='gasto'||xf==='ganho'||xf==='invest') { if (t.type!==xf) return false; }
     else if (xf==='imb') { if (t.type!=='gasto'||t.cls!=='imb') return false; }
     else if (xf==='nec') { if (t.type!=='gasto'||t.cls==='imb') return false; }
+    else if (xf==='resg') { if (!t.resg) return false; }
+    else if (xf==='skip') { if (!t.skip) return false; }
+    else if (xf==='dup') { if (!dupSet.has(t.id)) return false; }
     return !q || t.desc.toLowerCase().includes(q) || t.cat.toLowerCase().includes(q);
   });
   if (!list.length){ $('#x-list').innerHTML = `<div class="empty" style="margin-top:16px"><b>Nada por aqui</b>${DB.tx.length?'Tente outro filtro ou busca.':'Seus registros vão aparecer aqui.'}</div>`; return; }
   const total = sum(list); let html = '';
-  if (xf!=='all') html += `<div class="small muted" style="margin:14px 4px 0">Total do filtro: <b style="color:var(--txt)">${money(total.gasto+total.ganho+total.invest)}</b></div>`;
+  if (xf==='dup') html += `<div class="small muted" style="margin:14px 4px 0;line-height:1.5">Mesmo valor e datas próximas. Confira se não é o <b style="color:var(--txt)">mesmo lançamento registrado duas vezes</b> (ex: um à mão e outro do extrato, ou o salário fixo e o do extrato). Toque para abrir e excluir o repetido.</div>`;
+  if (xf!=='all' && xf!=='dup' && xf!=='skip') html += `<div class="small muted" style="margin:14px 4px 0">Total do filtro: <b style="color:var(--txt)">${money(total.gasto+total.ganho+total.aplic+total.resg)}</b></div>`;
   let last = '';
   const t0 = today(), y0 = ymd(new Date(Date.now()-864e5));
   for (const t of list.slice(0,400)){
@@ -317,15 +536,17 @@ function reportText(full){
   out += `GASTOS ${r.label}: ${money(s.gasto)}\n`;
   out += `GASTOS NECESSÁRIOS ${r.label}: ${money(s.nec)}\n`;
   out += `GASTOS IMBECIS ${r.label}: ${money(s.imb)}\n`;
-  out += `INVESTIMENTOS ${r.label}: ${money(s.invest)}\n`;
+  out += `INVESTIMENTOS ${r.label}: ${money(s.invest)} (aplicado ${money(s.aplic)} − resgatado ${money(s.resg)})\n`;
   out += `${r.end}: ${money(saldo)}`;
   if (!full) return out;
   const block = (title, arr) => { out += `\n\n${title}\n` + (arr.length ? arr.map(t=>`${fmtDate(t.date)}${t.time?' '+t.time:''}  ${t.desc} (${t.cat}${t.method?', '+t.method:''})${t.fixedId?' [fixo]':''}  ${money(t.value)}`).join('\n') : '(nenhum)'); };
-  block('— GANHOS —', list.filter(t=>t.type==='ganho'));
-  block('— GASTOS NECESSÁRIOS —', list.filter(t=>t.type==='gasto'&&t.cls!=='imb'));
-  block('— GASTOS IMBECIS —', list.filter(t=>t.type==='gasto'&&t.cls==='imb'));
-  block('— INVESTIMENTOS —', list.filter(t=>t.type==='invest'));
-  const cats = {}; list.filter(t=>t.type==='gasto').forEach(t=>cats[t.cat]=(cats[t.cat]||0)+t.value);
+  block('— GANHOS —', list.filter(t=>t.type==='ganho'&&!t.skip));
+  block('— GASTOS NECESSÁRIOS —', list.filter(t=>t.type==='gasto'&&t.cls!=='imb'&&!t.skip));
+  block('— GASTOS IMBECIS —', list.filter(t=>t.type==='gasto'&&t.cls==='imb'&&!t.skip));
+  block('— APLICAÇÕES —', list.filter(t=>t.type==='invest'&&!t.resg&&!t.skip));
+  block('— RESGATES —', list.filter(t=>t.type==='invest'&&t.resg&&!t.skip));
+  block('— FORA DOS TOTAIS —', list.filter(t=>t.skip));
+  const cats = {}; list.filter(t=>t.type==='gasto'&&!t.skip).forEach(t=>cats[t.cat]=(cats[t.cat]||0)+t.value);
   const top = Object.entries(cats).sort((a,b)=>b[1]-a[1]);
   if (top.length) out += `\n\n— ONDE O DINHEIRO FOI —\n` + top.map(([c,v])=>`${c}: ${money(v)} (${Math.round(v/s.gasto*100)}%)`).join('\n');
   out += `\n\nGerado em ${fmtDate(today())} pelo Evolvere.`;
@@ -346,8 +567,8 @@ $('#r-share').addEventListener('click', async () => {
 
 /* backup */
 $('#b-export').addEventListener('click', async () => {
-  await saving; const v = vault();
-  const file = {evolvere_backup:2, salt:v.salt, iter:v.iter, box: await seal(CK, JSON.stringify(DB))};
+  await saving;
+  const file = {evolvere_backup:3, email:EMAIL, box: await seal(CK, JSON.stringify(DB))};
   download(new File([JSON.stringify(file)], `evolvere_backup_${today()}.json`, {type:'application/json'})); toast('Backup criptografado salvo');
 });
 $('#b-import').addEventListener('click', () => $('#b-file').click());
@@ -356,13 +577,17 @@ $('#b-file').addEventListener('change', async e => {
   try {
     let d = JSON.parse(await f.text());
     if (d && d.box){ // backup criptografado
-      const v = vault(); let ok = false;
-      if (d.salt === v.salt && d.iter === v.iter){ try { d = await unseal(CK, d.box); ok = true; } catch(_){} }
-      if (!ok){ const [p] = await pwSheet('Senha usada quando o backup foi feito', ['Senha do backup']); d = await unseal(await deriveKey(p, unb64(d.salt), d.iter), d.box); }
+      let out = null;
+      if (d.evolvere_backup === 3){ try { out = await unseal(CK, d.box); } catch(_){} }
+      if (!out){
+        const [p] = await pwSheet('Senha usada quando o backup foi feito', ['Senha do backup']);
+        out = d.evolvere_backup === 3 ? await unseal((await deriveKeys(String(d.email || ''), p)).ck, d.box) : await unseal(await deriveKey(p, unb64(d.salt), d.iter), d.box);
+      }
+      d = out;
     }
     if (!Array.isArray(d.tx) || !Array.isArray(d.fixed)) throw 0;
     if (!confirm(`Restaurar ${d.tx.length} registros? Os dados atuais serão substituídos.`)) return;
-    DB = normalizeDB(d); save(); generateFixed(); fillSettings(); render(); toast('Backup restaurado');
+    const keep = DB.syncIds; DB = normalizeDB(d); DB.syncIds = keep; save(); generateFixed(); fillSettings(); render(); toast('Backup restaurado');
   } catch(err){ toast('Backup inválido ou senha errada'); }
   e.target.value = '';
 });
@@ -371,7 +596,7 @@ $('#b-file').addEventListener('change', async e => {
 function openSheet(id){ $('#scrim').classList.add('open'); $(id).classList.add('open'); }
 function closeSheets(fromPop){ if (!$('.sheet.open')) return; $('#scrim').classList.remove('open'); $$('.sheet').forEach(s=>s.classList.remove('open')); if (document.activeElement) document.activeElement.blur(); if (fromPop!==true && history.state && history.state.sheet) history.back(); }
 $('#scrim').addEventListener('click', () => closeSheets());
-window.addEventListener('popstate', () => closeSheets(true));
+window.addEventListener('popstate', () => { closeSheets(true); closeDrawer(true); });
 function pushSheetState(){ history.pushState({sheet:1}, ''); }
 
 function segPick(sel, attr, val){ $$(sel+' button').forEach(b=>b.classList.toggle('on', b.dataset[attr]===val)); }
@@ -395,16 +620,22 @@ function openTx(t){
   $('#t-date').value = t ? t.date : today();
   $('#t-time').value = t ? (t.time||'') : nowTime();
   $('#t-rep').classList.remove('on');
+  $('#t-skip').classList.toggle('on', !!(t && t.skip));
+  tResg = !!(t && t.resg); segPick('#t-resg','g', tResg ? 'res' : 'apl');
   $('#t-repbox').classList.toggle('hidden', !!t);
   $('#t-del').classList.toggle('hidden', !t);
   segPick('#t-type','t',tType); segPick('#t-cls','c',tCls);
   catChips('#t-cat', tType, t ? t.cat : null);
   $('#t-clsbox').classList.toggle('hidden', tType!=='gasto');
+  $('#t-resgbox').classList.toggle('hidden', tType!=='invest');
   openSheet('#sh-tx'); pushSheetState();
   if (!t) setTimeout(()=>$('#t-val').focus(), 320);
 }
 $('#nav-plus').addEventListener('click', () => openTx(null));
-$('#t-type').addEventListener('click', e => { const b=e.target.closest('button'); if(!b) return; tType=b.dataset.t; segPick('#t-type','t',tType); catChips('#t-cat',tType,chipVal('#t-cat')); $('#t-clsbox').classList.toggle('hidden', tType!=='gasto'); });
+$('#t-type').addEventListener('click', e => { const b=e.target.closest('button'); if(!b) return; tType=b.dataset.t; segPick('#t-type','t',tType); catChips('#t-cat',tType,chipVal('#t-cat')); $('#t-clsbox').classList.toggle('hidden', tType!=='gasto'); $('#t-resgbox').classList.toggle('hidden', tType!=='invest'); });
+let tResg = false;
+$('#t-resg').addEventListener('click', e => { const b=e.target.closest('button'); if(!b) return; tResg = b.dataset.g==='res'; segPick('#t-resg','g',b.dataset.g); });
+$('#t-skip').addEventListener('click', e => e.currentTarget.classList.toggle('on'));
 $('#t-cls').addEventListener('click', e => { const b=e.target.closest('button'); if(!b) return; tCls=b.dataset.c; segPick('#t-cls','c',tCls); });
 $('#t-rep').addEventListener('click', e => e.currentTarget.classList.toggle('on'));
 $('#t-save').addEventListener('click', () => {
@@ -415,8 +646,9 @@ $('#t-save').addEventListener('click', () => {
   const date = $('#t-date').value || today();
   const cls = tType==='gasto' ? tCls : null;
   const time = $('#t-time').value || '';
+  const skip = $('#t-skip').classList.contains('on'), resg = tType==='invest' && tResg;
   if (editTx){
-    Object.assign(editTx, {value, desc, cat, date, time, type:tType, cls});
+    Object.assign(editTx, {value, desc, cat, date, time, type:tType, cls, skip, resg});
     toast('Alterações salvas');
   } else if ($('#t-rep').classList.contains('on')){
     const d = parseYmd(date);
@@ -425,7 +657,7 @@ $('#t-save').addEventListener('click', () => {
     DB.tx.push({id:uid(), desc, value, type:tType, cls, cat, date, time, fixedId:f.id});
     toast('Registrado e salvo como fixo');
   } else {
-    DB.tx.push({id:uid(), desc, value, type:tType, cls, cat, date, time});
+    DB.tx.push({id:uid(), desc, value, type:tType, cls, cat, date, time, skip, resg});
     toast(tType==='gasto' && cls==='imb' ? 'Registrado. Da próxima vez, segura! 🤦' : 'Registrado');
   }
   learnRule(desc, tType, cat, cls); save(); generateFixed(); closeSheets(); render();
@@ -477,17 +709,20 @@ $('#fx-del').addEventListener('click', () => {
 
 /* ═════════ notificações ═════════ */
 const MSGS = [
-  'Eae Maurício! Gaste menos e invista mais, comprou algo e esqueceu de registrar?',
-  'Eae Maurício! Comprou alguma coisa e esqueceu de registrar? Gaste menos e invista mais.',
-  'Fala Maurício! Menos gastos, mais investimentos. Ficou alguma compra sem registrar?',
-  'Eae Maurício! Já registrou o que gastou hoje? Gaste menos e invista mais.',
-  'Maurício, gaste menos e invista mais! Passou no caixa e esqueceu de anotar?',
-  'Eae Maurício! Investir mais começa por gastar menos. Esqueceu de registrar algo?'
+  'Eae{n}! Gaste menos e invista mais, comprou algo e esqueceu de registrar?',
+  'Eae{n}! Comprou alguma coisa e esqueceu de registrar? Gaste menos e invista mais.',
+  'Fala{n}! Menos gastos, mais investimentos. Ficou alguma compra sem registrar?',
+  'Eae{n}! Já registrou o que gastou hoje? Gaste menos e invista mais.',
+  'Ei{n}, gaste menos e invista mais! Passou no caixa e esqueceu de anotar?',
+  'Eae{n}! Investir mais começa por gastar menos. Esqueceu de registrar algo?'
 ];
+const withName = m => m.replace('{n}', DB.settings.name ? ' ' + DB.settings.name : '');
+// guarda só o primeiro nome num lugar que o lembrete em segundo plano consegue ler
+function shareName(){ try { caches.open('evolvere-meta').then(c => c.put('./__meta', new Response(JSON.stringify({name: DB.settings.name || ''})))); } catch(e){} }
 let swReg = null;
 async function notify(){
   if (!('Notification' in window) || Notification.permission !== 'granted') return false;
-  const body = MSGS[Math.floor(Math.random()*MSGS.length)];
+  const body = withName(MSGS[Math.floor(Math.random()*MSGS.length)]);
   const opts = {body, icon:'icons/icon-192.png', badge:'icons/icon-192.png', tag:'evolvere-lembrete', renotify:true};
   try { if (swReg) await swReg.showNotification('Evolvere', opts); else new Notification('Evolvere', opts); return true; } catch(e){ return false; }
 }
@@ -505,7 +740,7 @@ async function askNotif(){
   const p = await Notification.requestPermission();
   DB.settings.notifAsked = true; save(); updateNotifBtn();
   if (p === 'granted'){ await setupReminders(); toast('Lembretes ativados'); }
-  else toast('Lembretes desativados. Dá pra ativar depois em Relatório.');
+  else toast('Lembretes desativados. Dá pra ativar depois em Ajustes.');
 }
 function updateNotifBtn(){
   const ok = 'Notification' in window && Notification.permission === 'granted';
@@ -523,6 +758,7 @@ const KW = [
   ['invest','Tesouro',/tesouro/], ['invest','Renda fixa',/\b(cdb|lci|lca|rdb)\b|caixinha|poupanca|renda fixa/],
   ['invest','Cripto',/cripto|bitcoin|binance|\bbtc\b/], ['invest','Ações',/\bacoes\b|corretora|\bfii/],
   ['invest','Reserva',/aplicacao|investimento|guardad/],
+  ['ganho','Rendimentos',/rendimento|\bjuros\b|dividendo|\bjcp\b/],
   ['ganho','Salário',/salario|folha de pag|proventos|vencimentos/], ['ganho','Reembolso',/reembolso|estorno|cashback|devoluc/],
   ['gasto','Alimentação',/ifood|rappi|restaurante|lanchonete|padaria|pizza|burger|mcdonald|subway|\bcafe|acai|lanche|delivery|churrasc|sushi/],
   ['gasto','Compras',/camis|roupa|tenis|sapato|calca|bermuda|vestido|amazon|mercado ?livre|shopee|magalu|magazine|americanas|shein|aliexpress|renner|riachuelo|c&a|zara|centauro|netshoes|kabum/],
@@ -558,6 +794,10 @@ $('#t-desc').addEventListener('change', () => {
 });
 
 /* ═════════ importar extrato (OFX / CSV) ═════════ */
+// tira ruído do extrato: aspas e códigos tipo "Cp :12345678-"
+function cleanDesc(d){
+  return String(d).replace(/["“”]/g, '').replace(/\bCp\s*:\s*\d+\s*-\s*/gi, '').replace(/\s+/g, ' ').replace(/\s*:\s*/g, ': ').trim().slice(0, 80) || 'Sem descrição';
+}
 async function readText(file){
   const buf = await file.arrayBuffer();
   let s = new TextDecoder('utf-8').decode(buf);
@@ -670,7 +910,6 @@ function checkDuplicates(rows){
     if (keys.has(r.key)){ r.status='dup'; r.on=false; r.note='Já importado antes'; continue; }
     const d = plain(r.desc);
     if (/pagamento (de )?fatura|pgto fatura|pagamento recebido/.test(d)){ r.status='maybe'; r.on=false; r.note='Pagamento de fatura: os gastos do cartão já contam separado'; continue; }
-    if (r.type==='ganho' && /resgate/.test(d)){ r.status='maybe'; r.on=false; r.note='Resgate de investimento: não é dinheiro novo'; continue; }
     let best = null, bestScore = 0;
     for (const t of DB.tx){
       if (used.has(t.id) || t.type !== r.type || Math.abs(t.value - r.value) > 0.009) continue;
@@ -700,9 +939,11 @@ async function startImport(file){
   const rows = res.rows.map(r => {
     const base = r.fitid ? `ofx:${r.fitid}:${r.date}:${Math.abs(r.amount).toFixed(2)}` : `csv:${r.date}:${r.amount.toFixed(2)}:${normKey(r.desc)}`;
     seen[base] = (seen[base]||0) + 1;
-    const g = guess(r.desc, r.amount < 0 ? 'gasto' : 'ganho');
-    return {key:`${base}#${seen[base]}`, date:r.date, time:r.time, desc:r.desc, value:Math.round(Math.abs(r.amount)*100)/100,
-      type:g.type, cat:g.cat, cls:g.type==='gasto' ? (g.cls||'nec') : null, method:detectMethod(r.desc, r.trnType, res.card), touched:false};
+    const desc = cleanDesc(r.desc), resg = r.amount > 0 && /\bresgate\b/.test(plain(desc));
+    const g = resg ? guess(desc, 'invest') : guess(desc, r.amount < 0 ? 'gasto' : 'ganho');
+    return {key:`${base}#${seen[base]}`, date:r.date, time:r.time, desc, value:Math.round(Math.abs(r.amount)*100)/100,
+      type: resg ? 'invest' : g.type, resg, cat: resg ? (CATS.invest.includes(g.cat) ? g.cat : 'Renda fixa') : g.cat,
+      cls:g.type==='gasto' && !resg ? (g.cls||'nec') : null, method:detectMethod(desc, r.trnType, res.card), touched:false};
   });
   checkDuplicates(rows);
   IMP = {rows, bad:res.bad, filter:'all', name:file.name};
@@ -713,7 +954,7 @@ $('#imp-file').addEventListener('change', e => { const f = e.target.files[0]; if
 
 function renderImport(){
   const R = IMP.rows, cnt = k => R.filter(r => r.status === k).length;
-  const ins = R.filter(r => r.type==='ganho').reduce((a,r)=>a+r.value,0), outs = R.filter(r => r.type!=='ganho').reduce((a,r)=>a+r.value,0);
+  const ins = R.filter(r => r.type==='ganho' || r.resg).reduce((a,r)=>a+r.value,0), outs = R.filter(r => r.type!=='ganho' && !r.resg).reduce((a,r)=>a+r.value,0);
   const dates = R.map(r => r.date).sort();
   $('#imp-sum').innerHTML = `<b>${esc(IMP.name)}</b><br>${R.length} transações de ${fmtDate(dates[0])} a ${fmtDate(dates[dates.length-1])}<br>
     Entradas no arquivo: <b style="color:var(--blue)">${money(ins)}</b> · Saídas: <b style="color:var(--red)">${money(outs)}</b><br>
@@ -729,9 +970,10 @@ function renderImport(){
         ${r.note ? `<div class="note">${esc(r.note)}</div>` : ''}
         <div class="ctl"><select data-ty="${i}" aria-label="Tipo">${['gasto','ganho','invest'].map(t => `<option value="${t}" ${t===r.type?'selected':''}>${LABEL[t]}</option>`).join('')}</select>
           <select data-ca="${i}" aria-label="Categoria">${CATS[r.type].map(c => `<option ${c===r.cat?'selected':''}>${esc(c)}</option>`).join('')}</select>
-          ${r.type==='gasto' ? `<button class="mini ${r.cls==='imb'?'imb':''}" data-cl="${i}">${r.cls==='imb'?'Imbecil':'Necessário'}</button>` : ''}</div>
+          ${r.type==='gasto' ? `<button class="mini ${r.cls==='imb'?'imb':''}" data-cl="${i}">${r.cls==='imb'?'Imbecil':'Necessário'}</button>` : ''}
+          ${r.type==='invest' ? `<button class="mini" data-rg="${i}">${r.resg?'Resgate ↩':'Aplicação'}</button>` : ''}</div>
       </div>
-      <div class="amt" style="color:${HEX[r.type]}">${r.type==='gasto'?'−':'+'} ${money(r.value)}</div></div>`).join('')
+      <div class="amt" style="color:${HEX[r.type]}">${r.type==='gasto'||r.resg?'−':'+'} ${money(r.value)}</div></div>`).join('')
     : '<div class="empty">Nada nesse filtro.</div>';
   const n = R.filter(r => r.on).length;
   $('#imp-go').textContent = n ? `Importar ${n} ${n===1?'transação':'transações'}` : 'Nada selecionado';
@@ -742,10 +984,11 @@ $('#imp-list').addEventListener('click', e => {
   const ck = e.target.closest('[data-ck]'), cl = e.target.closest('[data-cl]');
   if (ck){ const r = IMP.rows[ck.dataset.ck]; r.on = !r.on; renderImport(); }
   if (cl){ const r = IMP.rows[cl.dataset.cl]; r.cls = r.cls==='imb' ? 'nec' : 'imb'; r.touched = true; renderImport(); }
+  const rg = e.target.closest('[data-rg]'); if (rg){ const r = IMP.rows[rg.dataset.rg]; r.resg = !r.resg; renderImport(); }
 });
 $('#imp-list').addEventListener('change', e => {
   const t = e.target;
-  if (t.dataset.ty){ const r = IMP.rows[t.dataset.ty]; r.type = t.value; const g = guess(r.desc, r.type); r.cat = CATS[r.type].includes(g.cat) ? g.cat : CATS[r.type][0]; r.cls = r.type==='gasto' ? (r.cls||'nec') : null; r.touched = true; renderImport(); }
+  if (t.dataset.ty){ const r = IMP.rows[t.dataset.ty]; r.type = t.value; const g = guess(r.desc, r.type); r.cat = CATS[r.type].includes(g.cat) ? g.cat : CATS[r.type][0]; r.cls = r.type==='gasto' ? (r.cls||'nec') : null; if (r.type!=='invest') r.resg = false; r.touched = true; renderImport(); }
   if (t.dataset.ca){ const r = IMP.rows[t.dataset.ca]; r.cat = t.value; r.touched = true; }
 });
 $('#imp-x').addEventListener('click', () => { IMP = null; closeSheets(); });
@@ -759,7 +1002,7 @@ $('#imp-flip').addEventListener('click', () => {
 $('#imp-go').addEventListener('click', () => {
   const sel = IMP.rows.filter(r => r.on);
   for (const r of sel){
-    DB.tx.push({id:uid(), desc:r.desc, value:r.value, type:r.type, cls:r.type==='gasto' ? r.cls : null, cat:r.cat, date:r.date, time:r.time, method:r.method, importKey:r.key});
+    DB.tx.push({id:uid(), desc:r.desc, value:r.value, type:r.type, cls:r.type==='gasto' ? r.cls : null, cat:r.cat, date:r.date, time:r.time, method:r.method, importKey:r.key, resg:!!r.resg});
     if (r.touched) learnRule(r.desc, r.type, r.cat, r.cls);
   }
   save(); IMP = null; closeSheets(); render();
@@ -897,57 +1140,109 @@ function renderPlan(){
 /* ═════════ login ═════════ */
 const strong = p => p.length >= 10 && /[a-z]/.test(p) && /[A-Z]/.test(p) && /\d/.test(p) && /[^A-Za-z0-9]/.test(p);
 const lockState = () => { try { return JSON.parse(localStorage.getItem(LOCK)) || {fails:0, until:0}; } catch(e){ return {fails:0, until:0}; } };
+let authMode = '';
 function showAuth(){
-  const v = vault(), setup = !v;
-  $('#a-msg').textContent = setup ? 'Crie seu acesso. Seus dados ficam criptografados neste celular.' : 'Entre para ver suas finanças.';
-  $('#a-pass2').classList.toggle('hidden', !setup);
-  $('#a-pass').setAttribute('autocomplete', setup ? 'new-password' : 'current-password');
-  $('#a-go').textContent = setup ? 'Criar acesso' : 'Entrar';
-  $('#a-reset').classList.toggle('hidden', setup);
+  const v = vault();
+  if (v) authMode = 'login'; else if (!API) authMode = 'create'; else if (!authMode) authMode = 'login';
+  const create = authMode === 'create';
+  $('#a-msg').textContent = create
+    ? (API ? 'Crie sua conta. Seus dados são criptografados no celular antes de irem para a nuvem.' : 'Crie seu acesso. Seus dados ficam criptografados neste celular.')
+    : (v ? 'Entre para ver suas finanças.' : 'Entre com sua conta para trazer seus dados para este aparelho.');
+  $('#a-pass2').classList.toggle('hidden', !create);
+  $('#a-code').classList.toggle('hidden', !(create && API));
+  $('#a-name').classList.toggle('hidden', !create);
+  $('#a-pass').setAttribute('autocomplete', create ? 'new-password' : 'current-password');
+  $('#a-go').textContent = create ? 'Criar conta' : 'Entrar';
+  $('#a-reset').classList.toggle('hidden', !v);
+  $('#a-switch').classList.toggle('hidden', !!v || !API);
+  $('#a-switch').textContent = create ? 'Já tenho conta' : 'Criar conta nova';
   if (v) $('#a-email').value = v.email;
+  $('#a-err').textContent = '';
   $('#auth').classList.remove('hidden');
 }
+$('#a-switch').addEventListener('click', () => { authMode = authMode === 'create' ? 'login' : 'create'; showAuth(); });
+// o navegador às vezes limpa o campo ao recarregar: preenche o e-mail de novo depois que a página termina de abrir
+window.addEventListener('load', () => setTimeout(() => { const v = vault(); if (v && !$('#a-email').value) $('#a-email').value = v.email; }, 0));
+
+async function doLogin(email, pass){
+  const v = vault();
+  if (v && v.email === email){
+    try {
+      if (v.v === 2){ const k = await deriveKeys(email, pass); DB = normalizeDB(await unseal(k.ck, v.box)); setKeys(k, email); REV = v.rev || 0; CLOUD = !!v.cloud; }
+      else { const old = await deriveKey(pass, unb64(v.salt), v.iter); DB = normalizeDB(await unseal(old, v.box)); setKeys(await deriveKeys(email, pass), email); REV = 0; CLOUD = false; await writeLocal(); }
+      return 'ok';
+    } catch(e){ if (!API) return 'wrong'; } // a senha pode ter sido trocada em outro aparelho: tenta a nuvem
+  } else if (v) return 'other';
+  if (!API) return 'wrong';
+  const k = await deriveKeys(email, pass);
+  let r; try { r = await api('/acct/login', {u:k.uh, a:k.ak}); } catch(e){ return 'offline'; }
+  if (r.status === 200){
+    DB = normalizeDB(await unseal(k.ck, r.data.box)); DB.syncIds = idsOf(DB);
+    setKeys(k, email); REV = r.data.rev; CLOUD = true; await writeLocal(); return 'ok';
+  }
+  return r.status === 404 ? 'nouser' : r.status === 429 ? 'locked' : r.status === 401 ? 'wrong' : 'server';
+}
+async function doCreate(email, pass, code){
+  const k = await deriveKeys(email, pass);
+  let legacy = null; try { legacy = JSON.parse(localStorage.getItem(KEY)); } catch(e){}
+  DB = normalizeDB(legacy); REV = 0; CLOUD = false;
+  if (API){
+    let r; try { r = await api('/acct/register', {u:k.uh, a:k.ak, code, box: await seal(k.ck, JSON.stringify(DB))}); } catch(e){ return 'offline'; }
+    if (r.status === 403) return 'invite';
+    if (r.status === 409) return 'exists';
+    if (r.status !== 200) return 'server';
+    REV = r.data.rev; CLOUD = true; DB.syncIds = idsOf(DB);
+  }
+  const nm = $('#a-name').value.trim().slice(0, 30); if (nm) DB.settings.name = nm;
+  setKeys(k, email); await writeLocal(); localStorage.removeItem(KEY); return 'ok';
+}
+const AUTH_MSG = {wrong:'E-mail ou senha incorretos', nouser:'Conta não encontrada. Toque em "Criar conta nova".', locked:'Muitas tentativas erradas. Espere 15 minutos.',
+  offline:'Sem conexão com o servidor. Confira a internet.', other:'Este aparelho está com outra conta. Entre nela e use Menu ☰ → Ajustes → Sair desta conta.',
+  invite:'Código de convite errado', exists:'Essa conta já existe. Toque em "Já tenho conta".', server:'O servidor não respondeu direito. Tente de novo.', error:'Algo deu errado. Tente de novo.'};
 $('#a-go').addEventListener('click', async () => {
   const email = $('#a-email').value.trim().toLowerCase(), pass = $('#a-pass').value, err = $('#a-err'), btn = $('#a-go');
   err.textContent = '';
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ err.textContent = 'Digite um e-mail válido'; return; }
-  const v = vault();
-  if (!v){
+  const create = authMode === 'create';
+  if (create){
     if (!strong(pass)){ err.textContent = 'Use 10 ou mais caracteres, com maiúscula, minúscula, número e símbolo'; return; }
     if (pass !== $('#a-pass2').value){ err.textContent = 'As senhas não são iguais'; return; }
-    btn.disabled = true; btn.textContent = 'Protegendo seus dados…';
-    const salt = crypto.getRandomValues(new Uint8Array(16)); CK = await deriveKey(pass, salt);
-    let legacy = null; try { legacy = JSON.parse(localStorage.getItem(KEY)); } catch(e){}
-    DB = normalizeDB(legacy);
-    localStorage.setItem(VAULT, JSON.stringify({v:1, email, salt:b64(salt), iter:ITER, box: await seal(CK, JSON.stringify(DB))}));
-    localStorage.removeItem(KEY); // apaga a versão antiga sem criptografia
-    return enter();
+    if (API && !$('#a-code').value.trim()){ err.textContent = 'Digite o código de convite'; return; }
   }
   const L = lockState();
-  if (L.until > Date.now()){ err.textContent = `Muitas tentativas. Tente de novo em ${Math.ceil((L.until - Date.now())/1000)}s`; return; }
-  btn.disabled = true; btn.textContent = 'Entrando…';
-  let ok = false;
-  if (email === v.email){ try { const k = await deriveKey(pass, unb64(v.salt), v.iter); DB = normalizeDB(await unseal(k, v.box)); CK = k; ok = true; } catch(e){} }
-  btn.disabled = false; btn.textContent = 'Entrar';
-  if (!ok){
+  if (!create && L.until > Date.now()){ err.textContent = `Muitas tentativas. Tente de novo em ${Math.ceil((L.until - Date.now())/1000)}s`; return; }
+  const label = btn.textContent; btn.disabled = true; btn.textContent = create ? 'Protegendo seus dados…' : 'Entrando…';
+  let res;
+  try { res = create ? await doCreate(email, pass, $('#a-code').value.trim()) : await doLogin(email, pass); } catch(e){ res = 'error'; }
+  btn.disabled = false; btn.textContent = label;
+  if (res === 'ok'){ localStorage.removeItem(LOCK); return enter(); }
+  if (res === 'wrong'){
     const f = L.fails + 1, until = f >= 5 ? Date.now() + Math.min(900, 30 * 2 ** (f - 5)) * 1000 : 0;
     localStorage.setItem(LOCK, JSON.stringify({fails:f, until}));
-    err.textContent = 'E-mail ou senha incorretos' + (f >= 5 ? '. Aguarde um pouco para tentar de novo.' : '');
-    $('#a-pass').value = ''; return;
   }
-  localStorage.removeItem(LOCK); enter();
+  err.textContent = AUTH_MSG[res] || AUTH_MSG.error;
+  $('#a-pass').value = '';
 });
-['#a-pass','#a-pass2'].forEach(s => $(s).addEventListener('keydown', e => { if (e.key === 'Enter') $('#a-go').click(); }));
+['#a-pass','#a-pass2','#a-code'].forEach(s => $(s).addEventListener('keydown', e => { if (e.key === 'Enter') $('#a-go').click(); }));
 $('#a-reset').addEventListener('click', () => {
-  if (!confirm('Sem a senha não dá para abrir os dados: eles estão criptografados. Apagar TUDO deste celular e começar de novo?')) return;
-  if (!confirm('Tem certeza? Só faça isso se tiver um backup (e lembrar a senha dele).')) return;
+  const v = vault();
+  if (v && v.cloud){
+    if (!confirm('Se você trocou a senha em outro aparelho, é só digitar a senha nova aqui.\n\nSe esqueceu de vez: sem a senha ninguém consegue abrir os dados, nem na nuvem. Apagar a conta DESTE aparelho para entrar com outra?')) return;
+  } else {
+    if (!confirm('Sem a senha não dá para abrir os dados: eles estão criptografados. Apagar TUDO deste aparelho e começar de novo?')) return;
+    if (!confirm('Tem certeza? Só faça isso se tiver um backup (e lembrar a senha dele).')) return;
+  }
   localStorage.removeItem(VAULT); localStorage.removeItem(LOCK); location.reload();
 });
 function enter(){
-  $('#a-pass').value = ''; $('#a-pass2').value = ''; $('#auth').classList.add('hidden');
-  generateFixed();
+  $('#a-pass').value = ''; $('#a-pass2').value = ''; $('#a-code').value = ''; $('#a-name').value = ''; $('#auth').classList.add('hidden');
+  shareName();
+  fixOldData(); generateFixed();
   if (!DB.settings.notifAsked) $('#onb').classList.remove('hidden');
-  updateNotifBtn(); fillSettings(); render(); pullWhatsApp(false);
+  setSync(syncOn() ? 'wait' : 'local');
+  updateNotifBtn(); fillSettings(); render();
+  if (syncOn()) pullNow();
+  pullWhatsApp(false);
 }
 
 /* senha em janelinha (sem mostrar o texto) */
@@ -962,21 +1257,58 @@ function pwSheet(title, fields){
 $('#pw-ok').addEventListener('click', () => { const r = pwResolve; pwResolve = null; const vals = ['#pw-1','#pw-2','#pw-3'].map(s => $(s).value); closeSheets(); if (r) r(vals); });
 $('#s-pass').addEventListener('click', async () => {
   const [cur, n1, n2] = await pwSheet('Trocar senha', ['Senha atual', 'Nova senha', 'Repita a nova senha']);
-  await saving; const v = vault();
-  try { await unseal(await deriveKey(cur, unb64(v.salt), v.iter), v.box); } catch(e){ toast('Senha atual incorreta'); return; }
+  await saving;
+  try { await unseal((await deriveKeys(EMAIL, cur)).ck, vault().box); } catch(e){ toast('Senha atual incorreta'); return; }
   if (!strong(n1)){ toast('Senha fraca: 10+ caracteres, maiúscula, minúscula, número e símbolo'); return; }
   if (n1 !== n2){ toast('As senhas novas não são iguais'); return; }
-  const salt = crypto.getRandomValues(new Uint8Array(16)); CK = await deriveKey(n1, salt);
-  Object.assign(v, {salt:b64(salt), iter:ITER, box: await seal(CK, JSON.stringify(DB))}); localStorage.setItem(VAULT, JSON.stringify(v));
-  toast('Senha trocada. Faça um backup novo.');
+  toast('Trocando a senha…');
+  const k = await deriveKeys(EMAIL, n1);
+  if (syncOn()){
+    if (dirty) await pushNow();
+    let r; try { r = await api('/acct/password', {u:UH, a:AK, na:k.ak, rev:REV, box: await seal(k.ck, JSON.stringify(DB))}); }
+    catch(e){ toast('Precisa de internet para trocar a senha'); return; }
+    if (r.status !== 200){ toast(r.status === 409 ? 'Chegou alteração de outro aparelho. Tente de novo em instantes.' : 'Não consegui trocar a senha no servidor'); if (r.status === 409) pullNow(); return; }
+    REV = r.data.rev;
+  }
+  setKeys(k, EMAIL); await writeLocal();
+  toast(syncOn() ? 'Senha trocada. Nos outros aparelhos, entre com a senha nova.' : 'Senha trocada. Faça um backup novo.');
 });
-$('#s-lock').addEventListener('click', () => location.reload());
+$('#s-cloud').addEventListener('click', async () => {
+  if (!API){ toast('Falta colocar o endereço do servidor no arquivo config.js'); return; }
+  const [code] = await pwSheet('Código de convite do servidor', ['Código de convite']);
+  if (!code) return;
+  try {
+    let r = await api('/acct/register', {u:UH, a:AK, code:code.trim(), box: await seal(CK, JSON.stringify(DB))});
+    if (r.status === 409){ // a conta já existe na nuvem (criada em outro aparelho): junta os dados
+      r = await api('/acct/login', {u:UH, a:AK});
+      if (r.status !== 200){ toast('Essa conta existe na nuvem com outra senha. Saia e entre de novo.'); return; }
+      const remote = normalizeDB(await unseal(CK, r.data.box)); DB = mergeDB(DB, remote); DB.syncIds = idsOf(remote);
+      REV = r.data.rev; CLOUD = true; dirty = true; await pushNow();
+    } else if (r.status === 200){ REV = r.data.rev; CLOUD = true; DB.syncIds = idsOf(DB); setSync('ok'); }
+    else { toast(r.status === 403 ? 'Código de convite errado' : 'Servidor indisponível'); return; }
+    writeLocal(); fillSettings(); render(); toast('Sincronização ativada');
+  } catch(e){ toast('Sem conexão com o servidor'); }
+});
+$('#s-logout').addEventListener('click', async () => {
+  if (syncOn() && dirty) await pushNow();
+  const safe = syncOn() && !dirty;
+  if (!confirm(safe ? 'Sair desta conta neste aparelho? Seus dados continuam guardados na nuvem e voltam quando você entrar de novo.'
+                    : 'ATENÇÃO: esta conta NÃO está sincronizada com a nuvem. Sair apaga os dados deste aparelho. Faça um backup antes. Continuar mesmo assim?')) return;
+  try { caches.delete('evolvere-meta'); } catch(e){}
+  localStorage.removeItem(VAULT); localStorage.removeItem(LOCK); location.reload();
+});
+$('#s-lock').addEventListener('click', async () => { if (dirty) await pushNow(); setTimeout(() => location.reload(), 350); });
 
 /* ═════════ ajustes: IA e ponte do WhatsApp ═════════ */
 function fillSettings(){
+  $('#s-name').value = DB.settings.name || '';
   const S = DB.settings, v = vault();
-  $('#s-gkey').value = S.gkey || ''; $('#s-gmodel').value = S.gmodel || ''; $('#s-wurl').value = S.wurl || ''; $('#s-wtok').value = S.wtok || '';
-  $('#s-info').textContent = v ? `Conta: ${v.email}. Seus dados ficam criptografados (AES-256) neste celular e só abrem com a sua senha. O app bloqueia sozinho depois de 3 minutos fora dele.` : '';
+  $('#s-gkey').value = S.gkey || '';
+  $('#s-gkey').placeholder = syncOn() ? 'Não precisa: a IA já vem incluída na conta' : 'Cole sua chave aqui (sem sincronização)'; $('#s-gmodel').value = S.gmodel || ''; $('#s-wurl').value = S.wurl || ''; $('#s-wtok').value = S.wtok || '';
+  $('#s-info').textContent = `Conta: ${EMAIL}. Seus dados são criptografados (AES-256) aqui no aparelho e só abrem com a sua senha` + (syncOn() ? '. A nuvem recebe apenas os dados já embaralhados: nem o servidor consegue ler.' : '.') + ' O app bloqueia sozinho depois de 3 minutos fora dele.';
+  $('#s-cloud').classList.toggle('hidden', !API || syncOn());
+  $('#s-wurl').placeholder = API ? 'Em branco = usa o servidor do app' : 'https://evolvere-api.SEU-NOME.workers.dev';
+  setSync(syncState || (syncOn() ? 'wait' : 'local'));
 }
 $('#s-save').addEventListener('click', () => {
   const url = $('#s-wurl').value.trim().replace(/\/+$/, '');
@@ -993,7 +1325,7 @@ $('#s-test').addEventListener('click', () => pullWhatsApp(true));
 
 let pulling = false;
 async function pullWhatsApp(manual){
-  const url = DB.settings.wurl, tok = DB.settings.wtok;
+  const url = DB.settings.wurl || API, tok = DB.settings.wtok;
   if (!CK || pulling) return;
   if (!url || !tok){ if (manual) toast('Preencha o endereço e o código da ponte e salve'); return; }
   pulling = true;
@@ -1028,7 +1360,7 @@ function renderChat(){
     `<div class="bubble ${m.from === 'me' ? 'me' : 'bot'}">${esc(m.text).replace(/\n/g,'<br>')}${m.undo && m.undo.length && !m.undone ? `<button class="undo" data-undo="${i}">Desfazer</button>` : ''}${m.pending ? `<div class="ctl"><button class="mini" data-ok="${i}">Salvar</button><button class="mini" data-no="${i}">Descartar</button></div>` : ''}</div>`).join('');
   requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight));
 }
-const fmtItem = it => `${it.type === 'gasto' ? '−' : '+'} ${money(it.value)} · ${it.desc} · ${it.cat}${it.type === 'gasto' ? ' · ' + (it.cls === 'imb' ? 'Imbecil' : 'Necessário') : it.type === 'invest' ? ' · Investimento' : ' · Ganho'} · ${it.date === today() ? 'hoje' : fmtDate(it.date)}${it.time ? ' ' + it.time : ''}`;
+const fmtItem = it => `${it.type === 'gasto' || it.resg ? '−' : '+'} ${money(it.value)} · ${it.desc} · ${it.cat}${it.type === 'gasto' ? ' · ' + (it.cls === 'imb' ? 'Imbecil' : 'Necessário') : it.type === 'invest' ? (it.resg ? ' · Resgate' : ' · Investimento') : ' · Ganho'} · ${it.date === today() ? 'hoje' : fmtDate(it.date)}${it.time ? ' ' + it.time : ''}`;
 function saveItems(items, source){
   const ids = [];
   for (const it of items){ const t = {id:uid(), ...it, source}; DB.tx.push(t); ids.push(t.id); }
@@ -1053,7 +1385,8 @@ function parseMessage(line, base){
   if (!nums.length) return null;
   const value = Math.round(Math.max(...nums) * 100) / 100;
   if (value > 1e7) return null;
-  let type = /\b(investi|apliquei|guardei|aporte|aportei|tesouro|cdb|caixinha|poupanca)\b/.test(s) ? 'invest'
+  const resg = /\b(resgatei|resgate|saquei|tirei)\b/.test(s) && /\b(cdb|tesouro|investimento|caixinha|poupanca|porquinho|lci|lca|fundo|acoes)\b/.test(s);
+  let type = resg || /\b(investi|apliquei|guardei|aporte|aportei|tesouro|cdb|caixinha|poupanca)\b/.test(s) ? 'invest'
     : /\b(recebi|ganhei|entrou|caiu|salario|vendi|reembolso|freela|faturei)\b/.test(s) ? 'ganho' : 'gasto';
   const imb = /\b(imbecil|besteira|desnecessari[oa]|burrice|impulso|atoa|a toa|bobeira)\b/.test(s), nec = /\bnecessari[oa]\b/.test(s);
   let desc = line.split(/\s+/).filter(w => {
@@ -1064,7 +1397,7 @@ function parseMessage(line, base){
   if (g.type !== type && !(type === 'gasto' && g.type === 'invest')) g.cat = type === 'invest' ? 'Reserva' : 'Outros'; else type = g.type;
   const cls = type === 'gasto' ? (imb ? 'imb' : nec ? 'nec' : (g.cls || 'nec')) : null;
   desc = desc ? desc[0].toUpperCase() + desc.slice(1) : g.cat;
-  return {desc:desc.slice(0, 60), value, type, cls, cat:g.cat, date, time, method:detectMethod(line, '', false)};
+  return {desc:desc.slice(0, 60), value, type, cls, cat:g.cat, date, time, method:detectMethod(line, '', false), resg: type === 'invest' && resg};
 }
 function monthTxt(){
   const [f,t] = monthBounds(); const list = inRange(f,t), s = sum(list);
@@ -1081,7 +1414,7 @@ async function handleChat(text, source, base){
   }
   if (/^(saldo|quanto (eu )?(tenho|sobrou))$/.test(low)){
     const {s, saldo} = monthTxt();
-    return bot(`Este mês:\nGanhos ${money(s.ganho)}\nGastos ${money(s.gasto)} (imbecis ${money(s.imb)})\nInvestido ${money(s.invest)}\nSaldo ${money(saldo)}`);
+    return bot(`Este mês:\nGanhos ${money(s.ganho)}\nGastos ${money(s.gasto)} (imbecis ${money(s.imb)})\nInvestido ${money(s.invest)} (aplicou ${money(s.aplic)}, resgatou ${money(s.resg)})\nSaldo ${money(saldo)}`);
   }
   if (/^(gastos|quanto gastei|onde (eu )?gastei( mais)?)$/.test(low)){
     const {list, s} = monthTxt(), by = {}; list.filter(t => t.type === 'gasto').forEach(t => by[t.cat] = (by[t.cat] || 0) + t.value);
@@ -1095,20 +1428,36 @@ async function handleChat(text, source, base){
   const lines = text.split(/\n|;/).map(x => x.trim()).filter(Boolean).slice(0, 10);
   const items = lines.map(l => parseMessage(l, base));
   if (items.every(Boolean)){ saveItems(items, source); save(); return; }
-  if (!DB.settings.gkey) return bot(`Não entendi "${text.slice(0, 60)}". Escreva com o valor, por exemplo: "almoço 25". Se quiser que eu entenda frases mais livres, ative a IA em Relatório → Assistente.`);
+  if (!DB.settings.gkey && !(syncOn() && AK)) return bot(`Não entendi "${text.slice(0, 60)}". Escreva com o valor, por exemplo: "almoço 25". Se quiser que eu entenda frases mais livres, ative a IA em Menu ☰ → Ajustes.`);
   try {
     const ai = await askGemini(text, base);
     if (!ai.length) return bot('Não achei nenhum valor nessa mensagem. Tente: "mercado 87,35".');
     bot('Entendi assim, confere?\n' + ai.map(fmtItem).join('\n'), {pending:ai});
-  } catch(e){ bot('A IA não respondeu agora (limite gratuito ou sem internet). Tente escrever com o valor, ex: "uber 18".'); }
+  } catch(e){ bot(AI_MSG[e.message] || 'A IA não respondeu agora. Tente escrever com o valor, ex: "uber 18".'); }
 }
 function undoAt(i){
   const m = DB.chat[i]; DB.tx = DB.tx.filter(t => !m.undo.includes(t.id)); m.undone = true;
   bot('Desfeito ✓'); render();
 }
+const AI_MSG = {
+  quota: 'Você já usou as perguntas de IA de hoje. Amanhã libera de novo. Enquanto isso, escreva com o valor, ex: "uber 18".',
+  'ai-off': 'A IA está desligada no servidor no momento. Escreva com o valor, ex: "uber 18".',
+};
 async function askGemini(text, base){
-  const key = DB.settings.gkey, model = (DB.settings.gmodel || 'gemini-2.5-flash-lite').replace(/[^a-z0-9.\-]/gi, '');
   const ref = ymd(base || new Date());
+  let raw;
+  if (syncOn() && AK){
+    // caminho normal: a chave da IA fica no servidor, o app não precisa de nada
+    let r; try { r = await api('/acct/ai', {u:UH, a:AK, text, ref}); } catch(e){ throw new Error('net'); }
+    if (r.status === 429) throw new Error('quota');
+    if (r.status === 503) throw new Error('ai-off');
+    if (r.status !== 200) throw new Error('ai-fail');
+    raw = r.data.itens || [];
+    return raw.map(i => ({desc:String(i.desc||i.cat||''), value:Number(i.value), type:i.type, cls:i.type==='gasto'?(i.cls||'nec'):null, cat:i.cat, date:i.date||ref, time:'', method:''}))
+      .filter(i => i.value > 0 && CATS[i.type] && CATS[i.type].includes(i.cat));
+  }
+  // sem sincronização: usa a chave que a própria pessoa colocou em Ajustes
+  const key = DB.settings.gkey, model = (DB.settings.gmodel || 'gemini-2.5-flash-lite').replace(/[^a-z0-9.\-]/gi, '');
   const prompt = `Você extrai lançamentos financeiros de mensagens em português do Brasil. A data de hoje é ${ref}.
 Responda SOMENTE com JSON: {"itens":[{"tipo":"gasto|ganho|investimento","valor":numero,"descricao":"texto curto","categoria":"uma das listas","classificacao":"necessario|imbecil","data":"AAAA-MM-DD"}]}
 Categorias de gasto: ${CATS.gasto.join(', ')}. De ganho: ${CATS.ganho.join(', ')}. De investimento: ${CATS.invest.join(', ')}.
@@ -1121,13 +1470,13 @@ Mensagem: <<<${text.replace(/[<>]/g, '')}>>>`;
       headers:{'Content-Type':'application/json', 'x-goog-api-key':key},
       body:JSON.stringify({contents:[{parts:[{text:prompt}]}], generationConfig:{responseMimeType:'application/json', temperature:0}})
     });
-    if (!r.ok) throw new Error('http ' + r.status);
+    if (!r.ok) throw new Error('ai-fail');
     const j = await r.json();
     const out = JSON.parse(j?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
     const T = {gasto:'gasto', ganho:'ganho', investimento:'invest'};
     return (Array.isArray(out.itens) ? out.itens : []).slice(0, 10).map(i => {
       const type = T[i && i.tipo], value = Math.round(Number(i && i.valor) * 100) / 100;
-      if (!type || !(value > 0 && value < 1e7)) return null;   // valida tudo que vem da IA
+      if (!type || !(value > 0 && value < 1e7)) return null;
       const date = typeof i.data === 'string' && parseDateCell(i.data) ? parseDateCell(i.data).date : ref;
       const desc = String(i.descricao || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 60);
       const cat = CATS[type].includes(i.categoria) ? i.categoria : (CATS[type].includes(guess(desc, type).cat) ? guess(desc, type).cat : CATS[type][CATS[type].length - 1]);
@@ -1152,11 +1501,11 @@ if ('serviceWorker' in navigator){
 // virada de mês / dia com o app aberto
 let lastDay = today(), hiddenAt = 0;
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden){ hiddenAt = Date.now(); return; }
+  if (document.hidden){ hiddenAt = Date.now(); if (dirty) pushNow(); return; }
   if (!CK) return;
   if (hiddenAt && Date.now() - hiddenAt > 3*60*1000) return location.reload(); // bloqueio automático
   if (today()!==lastDay){ lastDay=today(); generateFixed(); }
-  render(); pullWhatsApp(false);
+  render(); pullNow(); pullWhatsApp(false);
 });
 setInterval(() => { if (CK && today()!==lastDay){ lastDay=today(); generateFixed(); render(); } }, 60000);
 

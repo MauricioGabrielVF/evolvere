@@ -1,20 +1,20 @@
 // Evolvere — service worker: funciona offline + lembretes
-const CACHE = 'evolvere-v3';
-const SHELL = ['./', './index.html', './app.js', './manifest.json', './icons/icon-192.png', './icons/icon-512.png', './icons/logo.png', './icons/apple-180.png'];
+const CACHE = 'evolvere-v8';
+const SHELL = ['./', './index.html', './config.js', './app.js', './manifest.json', './icons/icon-192.png', './icons/icon-512.png', './icons/logo.png', './icons/apple-180.png'];
 const MSGS = [
-  'Eae Maurício! Gaste menos e invista mais, comprou algo e esqueceu de registrar?',
-  'Eae Maurício! Comprou alguma coisa e esqueceu de registrar? Gaste menos e invista mais.',
-  'Fala Maurício! Menos gastos, mais investimentos. Ficou alguma compra sem registrar?',
-  'Eae Maurício! Já registrou o que gastou hoje? Gaste menos e invista mais.',
-  'Maurício, gaste menos e invista mais! Passou no caixa e esqueceu de anotar?',
-  'Eae Maurício! Investir mais começa por gastar menos. Esqueceu de registrar algo?'
+  'Eae{n}! Gaste menos e invista mais, comprou algo e esqueceu de registrar?',
+  'Eae{n}! Comprou alguma coisa e esqueceu de registrar? Gaste menos e invista mais.',
+  'Fala{n}! Menos gastos, mais investimentos. Ficou alguma compra sem registrar?',
+  'Eae{n}! Já registrou o que gastou hoje? Gaste menos e invista mais.',
+  'Ei{n}, gaste menos e invista mais! Passou no caixa e esqueceu de anotar?',
+  'Eae{n}! Investir mais começa por gastar menos. Esqueceu de registrar algo?'
 ];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE && k !== 'evolvere-meta').map(k => caches.delete(k)))).then(() => self.clients.claim()));
 });
 // rede primeiro (pega atualizações), cache se estiver offline
 self.addEventListener('fetch', e => {
@@ -31,10 +31,10 @@ self.addEventListener('fetch', e => {
 // lembrete periódico (Chrome Android com o app instalado)
 self.addEventListener('periodicsync', e => {
   if (e.tag !== 'evolvere-lembrete') return;
-  e.waitUntil(self.registration.showNotification('Evolvere', {
-    body: MSGS[Math.floor(Math.random() * MSGS.length)],
+  e.waitUntil(caches.open('evolvere-meta').then(c => c.match('./__meta')).then(r => r ? r.json() : {}).catch(() => ({})).then(meta => self.registration.showNotification('Evolvere', {
+    body: MSGS[Math.floor(Math.random() * MSGS.length)].replace('{n}', meta.name ? ' ' + meta.name : ''),
     icon: 'icons/icon-192.png', badge: 'icons/icon-192.png', tag: 'evolvere-lembrete', renotify: true
-  }));
+  })));
 });
 // tocar na notificação abre o app
 self.addEventListener('notificationclick', e => {
